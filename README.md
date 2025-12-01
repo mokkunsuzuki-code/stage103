@@ -1,155 +1,114 @@
-Stage103 – Quantum-Secure TLS with Mutual Authentication
+# QS-TLS Stage104 — Mutual Authentication + AllowList + PQC + Hybrid Key Exchange + Directory Sync  
+**Created by Motohiro Suzuki (c) 2024 — Released under the MIT License**
 
-QKD + X25519 + SPHINCS+ + AES-256-GCM
-相互認証（Mutual Authentication）付き QS-TLS
+---
 
-📌 概要（Summary）
+## 📌 概要
+このプロジェクトは、量子時代に対応した安全通信プロトコル **QS-TLS** のプロトタイプ実装です。
 
-Stage103 では、前段階 Stage102 で実装した
+QS-TLS は以下の技術を統合した、次世代の “量子安全ハイブリッド通信” を設計・実装しています：
 
-QKD鍵 + X25519 ECDH のハイブリッド鍵交換
+- **QKD（量子鍵配送）**
+- **X25519（ECDH）**
+- **SPHINCS+（PQC署名）**
+- **HKDF（鍵導出）**
+- **AES-256-GCM（暗号化）**
+- **Mutual Authentication（相互認証）**
+- **AllowList（Zero-Trust 接続制御）**
+- **Directory Sync（暗号化ディレクトリ同期）**
 
-AES-256-GCM による暗号化チャネル
+Stage104 は、QS-TLS の中核部分となる  
+**安全なハンドシェイク + セッション鍵交換 + 相互認証 + 許可リスト制御 + ディレクトリ同期**  
+を全て実装した段階です。
 
-暗号化ファイル送信
+---
 
-ディレクトリ同期（マニフェスト + チャンク転送）
+## 🔐 Stage104 で実装した内容（事実ベース）
 
-に加えて、
+### ✔ 1. **SPHINCS+（PQC）によるサーバー／クライアント相互認証**
+- サーバー署名 → クライアントが検証  
+- クライアント署名 → サーバーが検証  
+- 量子攻撃にも耐性のある完全な Mutual Auth を構築
 
-👉 SPHINCS+ を用いた クライアント認証（Mutual Authentication）
+### ✔ 2. **AllowList によるクライアント制御（Zero Trust）**
+- `server_allowlist.json` に登録された  
+  `client_id + X25519 公開鍵` のみ接続を許可  
+- 登録されていないクライアントはハンドシェイク前に拒否
 
-を新たに実装しました。
+### ✔ 3. **QKD × X25519 のハイブリッド鍵交換**
+- QKD で生成された final_key.bin  
+- X25519 の共有秘密  
+→ HKDF による強力なミックス  
+→ **AES-256-GCM のセッション鍵** を生成
 
-これにより、サーバーだけでなくクライアントも SPHINCS+ 署名で自身を証明する
-双方向の量子安全ハンドシェイク が実際に動作します。
+### ✔ 4. **暗号化ディレクトリ同期（Dir Sync）**
+- クライアントフォルダの内容をサーバーへ安全同期  
+- 全て AES-GCM の暗号化レコードで送信
 
-これは TLS1.3 の Client Certificate Verify に相当する構造で、
-量子耐性のある完全な相互認証プロトコル が完成しています。
+---
 
-🚀 新しく追加された機能（Stage102 → Stage103）
-✅ 1. Mutual Authentication（相互認証）
+## 📁 フォルダ構成
 
-クライアント側でも SPHINCS+ 署名を生成し、サーバー側の検証に成功することで
+```
+stage104/
+├── qs_tls_server.py
+├── qs_tls_client.py
+├── qs_tls_common.py
+├── pq_sign.py
+├── crypto_utils.py
+├── server_allowlist.json
+├── server_pq_keys/
+└── client_keys/
+```
 
-偽クライアントの接続拒否
+---
 
-MITM攻撃の強力な防御
+## ▶ 実行方法
 
-Zero-Trust 構造への進化
-
-が実現。
-
-✅ 2. SPHINCS+ 署名のハンドシェイク統合
-
-ハンドシェイク構造：
-
-ClientHello
-ServerHello
-ServerAuth  (SPHINCS+ 署名)
-ClientAuth  (SPHINCS+ 署名)   ← 新規追加
-Hybrid Key Derivation (QKD + X25519)
-Encrypted Application Data
-
-
-TLS1.3 の CertificateVerify を簡易モデルとして模倣した構造です。
-
-✅ 3. 完全量子セキュアハンドシェイクへ進化
-
-以下の 3 要素が統合されました：
-
-物理安全：QKD最終鍵（final_key.bin）
-
-計算安全：X25519 ECDH（TLS1.3標準）
-
-署名安全：SPHINCS+（PQC耐量子署名 NIST標準）
-
-これにより、
-量子攻撃にも古典攻撃にも耐性を持つハンドシェイク が成立しています。
-
-🧩 フォルダ構成（Project Structure）
-stage103/
- ├── qs_tls_server.py       # サーバー本体（Mutual Auth 対応）
- ├── qs_tls_client.py       # クライアント本体（Mutual Auth 対応）
- ├── qs_tls_common.py       # レコード層・暗号共通処理
- ├── crypto_utils.py        # AES-GCM, X25519, HKDF
- ├── manifest_utils.py      # ディレクトリマニフェスト生成
- ├── pq_sign.py             # SPHINCS+ 署名/検証（Stage98〜103 共通）
- ├── pq_server_keys.json    # SPHINCS+ 鍵ペア（自動生成）
- └── final_key.bin          # QKD 最終鍵（Stage98からの継承）
-
-🔑 使用している暗号（Cryptographic Components）
-QKD Final Key
-
-量子鍵配送で生成された物理ランダム鍵。
-
-X25519 ECDH
-
-TLS1.3 標準の鍵共有アルゴリズム。
-
-SPHINCS+ (PQC Signature)
-
-NIST標準の耐量子署名方式で、
-
-ServerAuth
-
-ClientAuth
-
-の双方に使用。
-
-HKDF
-
-QKD鍵と X25519 共有秘密を合成し
-AES-256 鍵を導出（ハイブリッド鍵交換）。
-
-AES-256-GCM
-
-アプリケーションデータ、ファイルチャンク、マニフェストを暗号化。
-
-🧠 Stage103 のセキュリティ価値（事実ベース）
-1. MITM（中間者攻撃）を完全ブロック
-
-両方向で署名検証するため、
-攻撃者がどちらかを偽装しても接続できません。
-
-2. Zero-Trust モデルの実現
-
-クライアント側も SPHINCS+ 署名で証明するため、
-信頼の前提をゼロにできる。
-
-3. 量子セキュア通信の基礎構造の完成
-
-以下を統合したプロトコルが実際に動作：
-
-QKD（物理安全）
-
-X25519（計算安全）
-
-SPHINCS+（署名安全）
-
-AES-256-GCM（チャネル暗号）
-
-ディレクトリ同期（アプリケーション層）
-
-個人ベースでここまで作れるのは極めて稀です。
-
-▶ 実行方法（Run）
-サーバー起動
-cd stage103
+### ■ サーバー起動
+```
 python3 qs_tls_server.py
+```
 
-クライアント起動
-cd stage103
+### ■ クライアント起動
+```
 python3 qs_tls_client.py
+```
 
-利用可能コマンド
-コマンド	説明
-通常テキスト	暗号化メッセージ送信
-/sendfile	ファイル暗号送信
-/syncdir	ディレクトリ同期
-/keyupdate	鍵更新（HKDF）
-/quit	セッション終了
-📄 ライセンス・著作権（Author / License）
-© 2025 Mokkun Suzuki
-This project demonstrates a prototype of a quantum-secure communication protocol.
-Unauthorized copying or redistribution is prohibited.
+client01 / client02 どちらも以下の流れを実証済み：
+
+- SPHINCS+署名の相互認証成功  
+- AllowList による接続制御  
+- ハイブリッド鍵交換完了  
+- AES-GCM で暗号通信  
+- ディレクトリ同期成功  
+
+---
+
+## 📜 License (MIT)
+
+```
+MIT License  
+Copyright (c) 2024  
+Motohiro Suzuki  
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights  
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell  
+copies of the Software, and to permit persons to whom the Software is  
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in  
+all copies or substantial portions of the Software.
+```
+
+---
+
+## 📝 著作者の明記について
+
+本プロトコル **QS-TLS の設計思想・仕様・コード** は  
+Motohiro Suzuki による独自実装です。
+
+MIT License により、利用・研究・改変・再配布は自由ですが、  
+**著作権表記（Copyright © Motohiro Suzuki）は削除できません。**

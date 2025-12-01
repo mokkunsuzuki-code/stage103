@@ -1,8 +1,11 @@
 """
-qs_tls_server.py - QS-TLS Server (Stage103)
-QKD + X25519 ハイブリッド鍵交換 + SPHINCS+ による
-サーバー認証 ＆ クライアント認証（Mutual Authentication） +
-暗号化ディレクトリ同期
+qs_tls_server.py - QS-TLS Server (Stage104)
+QKD + X25519 ハイブリッド鍵交換 +
+SPHINCS+ によるサーバー認証 ＋ クライアント認証（Mutual Auth） +
+暗号化ディレクトリ同期 ＋ クライアントAllowlist
+
+- クライアントは固定X25519鍵（クライアントIDごと）を使用
+- サーバーは server_allowlist.json に登録された X25519 公開鍵のみ許可
 """
 
 import os
@@ -10,7 +13,7 @@ import socket
 import json
 import base64
 import hashlib
-from typing import Any, Tuple, Optional
+from typing import Any, Tuple, Optional, List, Dict
 
 from crypto_utils import (
     load_qkd_key,
@@ -37,7 +40,8 @@ import pq_sign
 
 
 HOST = "127.0.0.1"
-PORT = 50300  # Stage103 用ポート（Stage102: 50200 から変更）
+PORT = 50400  # Stage104 用ポート
+ALLOWLIST_PATH = "server_allowlist.json"
 
 
 # ======== PQ鍵ロード（dict / tuple 両対応） ========
@@ -78,8 +82,8 @@ def _normalize_pq_keys(info: Any) -> Tuple[bytes, bytes]:
 
 def load_server_pq_keypair() -> Tuple[bytes, bytes]:
     """
-    サーバー（兼クライアント）で利用する SPHINCS+ 鍵ペアをロード。
-    ※ Stage103 では簡易化のため、サーバーとクライアントで同じ鍵ペアを共有する。
+    サーバー（SPHINCS+）で利用する鍵ペアをロード。
+    ※ Stage98〜103 と同じ pq_sign の鍵をそのまま使用。
     """
     if hasattr(pq_sign, "ensure_server_keys"):
         info = pq_sign.ensure_server_keys()
@@ -107,18 +111,86 @@ def verify_pq_signature(message: bytes, signature: bytes, public_key: bytes) -> 
     return True
 
 
+# ======== Allowlist の管理 ========
+
+def load_or_init_allowlist() -> Dict:
+    """
+    server_allowlist.json を読み込む。
+    なければ空の allowlist を作成して保存。
+    構造:
+    {
+      "allowed_clients": [
+        {"client_id": "client01", "x25519_pub_hex": "abcd..."},
+        ...
+      ]
+    }
+    """
+    if not os.path.exists(ALLOWLIST_PATH):
+        data = {"allowed_clients": []}
+        with open(ALLOWLIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"[Server] Allowlist を新規作成しました: {ALLOWLIST_PATH}")
+        return data
+
+    with open(ALLOWLIST_PATH, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            data = {"allowed_clients": []}
+    if "allowed_clients" not in data or not isinstance(data["allowed_clients"], list):
+        data["allowed_clients"] = []
+    return data
+
+
+def save_allowlist(data: Dict) -> None:
+    with open(ALLOWLIST_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def is_client_allowed(allowlist: Dict, client_pub_hex: str) -> bool:
+    for entry in allowlist.get("allowed_clients", []):
+        if entry.get("x25519_pub_hex") == client_pub_hex:
+            return True
+    return False
+
+
+def register_first_client_if_empty(allowlist: Dict, client_id: str, client_pub_hex: str) -> bool:
+    """
+    allowlist が空の場合のみ、最初のクライアントを自動登録する。
+    戻り値: True = 登録した / すでに登録済み, False = 登録していない
+    """
+    clients: List[Dict] = allowlist.get("allowed_clients", [])
+    if clients:
+        return False  # 既に誰か登録済みなら何もしない
+
+    entry = {
+        "client_id": client_id,
+        "x25519_pub_hex": client_pub_hex,
+    }
+    clients.append(entry)
+    allowlist["allowed_clients"] = clients
+    save_allowlist(allowlist)
+    print(f"[Server] Allowlist が空だったため、最初のクライアントを自動登録しました:")
+    print(f"         client_id={client_id}, x25519_pub_hex={client_pub_hex}")
+    return True
+
+
 # ======== メイン ========
 
 def main():
-    print("=== QS-TLS Server (Stage103: Mutual Auth + Dir Sync) ===")
+    print("=== QS-TLS Server (Stage104: Mutual Auth + Allowlist + Dir Sync) ===")
 
     # QKD鍵ロード
     qkd_key = load_qkd_key("final_key.bin")
     print(f"[Server] QKD鍵読込み完了: {len(qkd_key)} バイト")
 
-    # PQ署名鍵ロード（サーバー＆クライアントで共有する鍵ペア）
+    # PQ署名鍵ロード（サーバー用）
     pq_public_key, pq_secret_key = load_server_pq_keypair()
     print(f"[Server] PQ公開鍵長: {len(pq_public_key)} バイト")
+
+    # Allowlist ロード（クライアント専用 X25519 公開鍵リスト）
+    allowlist = load_or_init_allowlist()
+    print(f"[Server] Allowlist 内クライアント数: {len(allowlist.get('allowed_clients', []))}")
 
     # 受信先ルートディレクトリ
     recv_root = os.path.abspath("server_sync_root")
@@ -144,7 +216,7 @@ def main():
                 raise RuntimeError("[Server] client_hello が来ていません。")
             print("[Server] ClientHello 受信:", ch)
 
-            # X25519 鍵ペア生成（サーバー側）
+            # X25519 鍵ペア生成（サーバー側・エフェメラル）
             server_x_priv, server_x_pub = generate_x25519_keypair()
 
             # === Handshake: ServerHello ===
@@ -171,7 +243,7 @@ def main():
             send_record(conn, RECORD_TYPE_HANDSHAKE, json.dumps(sa).encode("utf-8"))
             print("[Server] ServerAuth 送信")
 
-            # === Handshake: ClientAuth (相互認証) ===
+            # === Handshake: ClientAuth (相互認証 + Allowlist チェック) ===
             rtype, payload = recv_record(conn)
             if rtype != RECORD_TYPE_HANDSHAKE:
                 raise RuntimeError("[Server] ClientAuth が Handshake レコードではありません。")
@@ -180,13 +252,30 @@ def main():
             if ca.get("msg_type") != "client_auth":
                 raise RuntimeError("[Server] client_auth が来ていません。")
 
-            client_x_pub_bytes = bytes.fromhex(ca["x25519_pub"])
+            client_id = ca.get("client_id", "unknown")
+            client_x_pub_hex = ca["x25519_pub"]
+            client_x_pub_bytes = bytes.fromhex(client_x_pub_hex)
             client_signature = bytes.fromhex(ca["signature"])
-            client_auth_payload = b"QS-TLS-CLIENT-AUTH|" + client_x_pub_bytes
 
+            client_auth_payload = (
+                b"QS-TLS-CLIENT-AUTH|" + client_id.encode("utf-8") + b"|" + client_x_pub_bytes
+            )
+
+            # PQ署名検証（クライアント認証）
             if not verify_pq_signature(client_auth_payload, client_signature, pq_public_key):
                 raise RuntimeError("[Server] クライアントPQ署名の検証に失敗しました。")
-            print("[Server] クライアントPQ署名検証 OK（クライアント認証完了）")
+            print(f"[Server] クライアントPQ署名検証 OK（client_id={client_id}）")
+
+            # Allowlist チェック
+            # 1) Allowlist が空なら、自動で最初のクライアントを登録
+            registered = register_first_client_if_empty(allowlist, client_id, client_x_pub_hex)
+            if not registered:
+                # 2) すでに Allowlist にクライアントがいる場合は、一致するかチェック
+                if not is_client_allowed(allowlist, client_x_pub_hex):
+                    print("[Server] このクライアントのX25519鍵は Allowlist に登録されていません。接続を拒否します。")
+                    raise RuntimeError("クライアントが許可リストにありません。")
+
+            print(f"[Server] Allowlist チェックOK（client_id={client_id}）")
 
             # 共有秘密 + ハイブリッドAES鍵
             client_x_pub = load_peer_public_key(client_x_pub_bytes)
@@ -307,7 +396,6 @@ def main():
                 elif rtype == RECORD_TYPE_FILE_CHUNK:
                     # ファイル本体チャンク
                     if skip_current_file:
-                        # スキップ対象ファイル。チャンクは読み捨て。
                         continue
 
                     if file_out is None:

@@ -1,8 +1,11 @@
 """
-qs_tls_client.py - QS-TLS Client (Stage103)
+qs_tls_client.py - QS-TLS Client (Stage104)
 QKD + X25519 ハイブリッド鍵交換 +
 SPHINCS+ によるサーバー認証 ＋ クライアント認証（Mutual Auth） +
 暗号化ファイル送信 & ディレクトリ同期
+
+- クライアントIDごとに固定X25519鍵を生成＆保存
+- サーバー側の Allowlist に登録されたX25519公開鍵だけ接続可能
 """
 
 import os
@@ -13,7 +16,6 @@ from typing import Any, Tuple
 
 from crypto_utils import (
     load_qkd_key,
-    generate_x25519_keypair,
     load_peer_public_key,
     derive_shared_secret,
     hybrid_derive_aes_key,
@@ -35,9 +37,16 @@ from qs_tls_common import (
 from manifest_utils import build_manifest
 import pq_sign
 
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
+from cryptography.hazmat.primitives import serialization
+
 
 HOST = "127.0.0.1"
-PORT = 50300  # サーバーと合わせる
+PORT = 50400  # サーバーと合わせる
+CLIENT_KEYS_DIR = "client_keys"
 
 
 # ======== PQ 鍵ペアロード（dict / tuple 両対応） ========
@@ -78,7 +87,8 @@ def _normalize_pq_keys(info: Any) -> Tuple[bytes, bytes]:
 
 def load_pq_keypair() -> Tuple[bytes, bytes]:
     """
-    サーバーとクライアントで共通利用する SPHINCS+ 鍵ペアをロード。
+    SPHINCS+ 鍵ペアをロード。
+    ※ Stage98〜103 と同じ pq_sign の鍵をそのまま使用。
     """
     if hasattr(pq_sign, "ensure_server_keys"):
         info = pq_sign.ensure_server_keys()
@@ -106,7 +116,46 @@ def verify_pq_signature(message: bytes, signature: bytes, public_key: bytes) -> 
     return True
 
 
-# ======== 単一ファイル送信（Stage101/102 互換） ========
+# ======== クライアント用 固定X25519鍵 管理 ========
+
+def load_or_create_client_x25519(client_id: str) -> Tuple[X25519PrivateKey, bytes]:
+    """
+    クライアントIDごとの固定X25519秘密鍵を生成・ロードする。
+    秘密鍵は PEM として client_keys/{client_id}_x25519.pem に保存。
+    戻り値:
+      (X25519PrivateKeyオブジェクト, 公開鍵(32バイト))
+    """
+    os.makedirs(CLIENT_KEYS_DIR, exist_ok=True)
+    key_path = os.path.join(CLIENT_KEYS_DIR, f"{client_id}_x25519.pem")
+
+    if os.path.exists(key_path):
+        with open(key_path, "rb") as f:
+            priv = serialization.load_pem_private_key(
+                f.read(),
+                password=None,
+            )
+        if not isinstance(priv, X25519PrivateKey):
+            raise RuntimeError("保存されている鍵が X25519PrivateKey ではありません。")
+    else:
+        priv = X25519PrivateKey.generate()
+        pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        with open(key_path, "wb") as f:
+            f.write(pem)
+        print(f"[Client] 新しいX25519鍵を生成しました: {key_path}")
+
+    pub = priv.public_key()
+    pub_bytes = pub.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return priv, pub_bytes
+
+
+# ======== 単一ファイル送信 ========
 
 def send_encrypted_file(sock: socket.socket, aes_key: bytes) -> None:
     """
@@ -150,7 +199,7 @@ def send_encrypted_file(sock: socket.socket, aes_key: bytes) -> None:
     print(f"[Client] ファイル送信完了: {filename}")
 
 
-# ======== ディレクトリ同期（Stage102/103 のメイン機能） ========
+# ======== ディレクトリ同期 ========
 
 def sync_directory(sock: socket.socket, aes_key: bytes) -> None:
     """
@@ -219,15 +268,26 @@ def sync_directory(sock: socket.socket, aes_key: bytes) -> None:
 # ======== メイン ========
 
 def main():
-    print("=== QS-TLS Client (Stage103: Mutual Auth + Dir Sync) ===")
+    print("=== QS-TLS Client (Stage104: Mutual Auth + Allowlist + Dir Sync) ===")
+
+    # クライアントIDを入力（例: client01）
+    client_id = input("クライアントIDを入力してください（例: client01）: ").strip()
+    if not client_id:
+        client_id = "client01"
+    print(f"[Client] 使用クライアントID: {client_id}")
 
     # QKD鍵ロード
     qkd_key = load_qkd_key("final_key.bin")
     print(f"[Client] QKD鍵読込み完了: {len(qkd_key)} バイト")
 
-    # PQ 鍵ペアロード（サーバーと共有）
+    # PQ 鍵ペアロード（サーバー／クライアント共通のSPHINCS+鍵）
     pq_public_key, pq_secret_key = load_pq_keypair()
     print(f"[Client] PQ公開鍵 長さ: {len(pq_public_key)} バイト")
+
+    # 固定X25519鍵（クライアントIDごと）
+    client_x_priv, client_x_pub_bytes = load_or_create_client_x25519(client_id)
+    client_x_pub_hex = client_x_pub_bytes.hex()
+    print(f"[Client] X25519 公開鍵(hex): {client_x_pub_hex[:16]}...")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((HOST, PORT))
@@ -237,7 +297,7 @@ def main():
         ch = {
             "msg_type": "client_hello",
             "protocol": "QS-TLS-1.0",
-            "client_name": "Stage103-Client",
+            "client_name": f"Stage104-Client-{client_id}",
             "support_groups": ["x25519"],
         }
         send_record(s, RECORD_TYPE_HANDSHAKE, json.dumps(ch).encode("utf-8"))
@@ -272,13 +332,15 @@ def main():
         if not hasattr(pq_sign, "sign_message"):
             raise RuntimeError("pq_sign.py に sign_message() がありません。")
 
-        client_x_priv, client_x_pub = generate_x25519_keypair()
-        client_auth_payload = b"QS-TLS-CLIENT-AUTH|" + client_x_pub
+        client_auth_payload = (
+            b"QS-TLS-CLIENT-AUTH|" + client_id.encode("utf-8") + b"|" + client_x_pub_bytes
+        )
         client_signature = pq_sign.sign_message(client_auth_payload, pq_secret_key)  # type: ignore[attr-defined]
 
         ca = {
             "msg_type": "client_auth",
-            "x25519_pub": client_x_pub.hex(),
+            "client_id": client_id,
+            "x25519_pub": client_x_pub_hex,
             "signature": client_signature.hex(),
         }
         send_record(s, RECORD_TYPE_HANDSHAKE, json.dumps(ca).encode("utf-8"))
